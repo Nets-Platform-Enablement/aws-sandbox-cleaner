@@ -39,6 +39,7 @@ STOP_EC2 = os.environ.get("STOP_EC2", "false").strip().lower() == "true"
 # SNS topic that receives the cleanup report. Empty means notifications are off.
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "").strip()
 SNS_MESSAGE_MAX_BYTES = 262144
+SNS_PUBLISH_OVERHEAD_BYTES = 1024
 
 # Summary of actions for reporting.
 _actions: list[str] = []
@@ -664,15 +665,20 @@ def _publish_report(session: boto3.Session) -> None:
         logger.info("SNS_TOPIC_ARN not set - skipping notification.")
         return
     subject, body = _build_report()
+    subject_bytes = len(subject.encode("utf-8"))
+    max_body_bytes = max(
+        SNS_MESSAGE_MAX_BYTES - subject_bytes - SNS_PUBLISH_OVERHEAD_BYTES,
+        0,
+    )
     body_bytes = body.encode("utf-8")
-    if len(body_bytes) > SNS_MESSAGE_MAX_BYTES:
+    if len(body_bytes) > max_body_bytes:
         suffix = "\n\n[truncated]"
         suffix_bytes = suffix.encode("utf-8")
-        max_bytes = max(SNS_MESSAGE_MAX_BYTES - len(suffix_bytes), 0)
-        if SNS_MESSAGE_MAX_BYTES > len(suffix_bytes):
+        max_bytes = max(max_body_bytes - len(suffix_bytes), 0)
+        if max_body_bytes > len(suffix_bytes):
             body = body_bytes[:max_bytes].decode("utf-8", errors="ignore") + suffix
         else:
-            body = body_bytes[:SNS_MESSAGE_MAX_BYTES].decode("utf-8", errors="ignore")
+            body = body_bytes[:max_body_bytes].decode("utf-8", errors="ignore")
     try:
         region = SNS_TOPIC_ARN.split(":")[3]
         sns = session.client("sns", region_name=region)
