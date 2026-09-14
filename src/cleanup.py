@@ -148,10 +148,13 @@ def clean_ebs_volumes(session: boto3.Session, region: str) -> None:
             if _tags_protect(vol.get("Tags")):
                 continue
             vid = vol["VolumeId"]
-            _record("unattached EBS volume", vid, region, f"{vol.get('Size')} GiB")
-            if not DRY_RUN:
+            extra = f"{vol.get('Size')} GiB"
+            if DRY_RUN:
+                _record("unattached EBS volume", vid, region, extra)
+            else:
                 try:
                     ec2.delete_volume(VolumeId=vid)
+                    _record("unattached EBS volume", vid, region, extra)
                 except ClientError as e:
                     logger.warning("Failed to delete EBS volume %s: %s", vid, e)
 
@@ -174,12 +177,14 @@ def clean_elastic_ips(session: boto3.Session, region: str) -> None:
             # AWS bills every allocated public IPv4 address, even while associated,
             # so associated EIPs are disassociated and released too.
             label = "Elastic IP" if assoc else "unassociated Elastic IP"
-            _record(label, public_ip, region, verb="release")
-            if not DRY_RUN:
+            if DRY_RUN:
+                _record(label, public_ip, region, verb="release")
+            else:
                 try:
                     if assoc:
                         ec2.disassociate_address(AssociationId=assoc)
                     ec2.release_address(AllocationId=alloc)
+                    _record(label, public_ip, region, verb="release")
                 except ClientError as e:
                     logger.warning("Failed to release Elastic IP %s: %s", public_ip, e)
         next_token = resp.get("NextToken")
@@ -195,10 +200,12 @@ def clean_nat_gateways(session: boto3.Session, region: str) -> None:
             if _tags_protect(nat.get("Tags")):
                 continue
             nid = nat["NatGatewayId"]
-            _record("NAT gateway", nid, region)
-            if not DRY_RUN:
+            if DRY_RUN:
+                _record("NAT gateway", nid, region)
+            else:
                 try:
                     ec2.delete_nat_gateway(NatGatewayId=nid)
+                    _record("NAT gateway", nid, region)
                 except ClientError as e:
                     logger.warning("Failed to delete NAT gateway %s: %s", nid, e)
 
