@@ -354,6 +354,15 @@ def clean_ecs(session: boto3.Session, region: str) -> None:
                         except ClientError as e:
                             logger.warning("Failed to delete ECS service %s: %s", svc_arn, e)
 
+            # Service deletion is async; wait before handling standalone tasks.
+            if not DRY_RUN and deleted_services:
+                try:
+                    ecs.get_waiter("services_inactive").wait(
+                        cluster=cluster_arn, services=deleted_services
+                    )
+                except (ClientError, BotoCoreError) as e:
+                    logger.warning("Failed waiting for ECS services in %s: %s", cluster_arn, e)
+
             # Stop standalone tasks (those not owned by a service).
             stopped_tasks: list[str] = []
             for task_page in ecs.get_paginator("list_tasks").paginate(cluster=cluster_arn):
@@ -382,11 +391,7 @@ def clean_ecs(session: boto3.Session, region: str) -> None:
             _record("ECS cluster", cluster_arn, region)
             if not DRY_RUN:
                 try:
-                    # delete_service and stop_task are async; wait for both to drain.
-                    if deleted_services:
-                        ecs.get_waiter("services_inactive").wait(
-                            cluster=cluster_arn, services=deleted_services
-                        )
+                    # stop_task is async; wait for tasks to drain before cluster delete.
                     for batch in _chunked(stopped_tasks, 100):
                         ecs.get_waiter("tasks_stopped").wait(cluster=cluster_arn, tasks=batch)
                     ecs.delete_cluster(cluster=cluster_arn)
