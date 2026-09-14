@@ -242,7 +242,7 @@ class _Protection:
         self.volumes = {
             v["VolumeId"]: v for v in _items(ec2, "describe_volumes", "Volumes")
         }
-        self.addresses = ec2.describe_addresses()["Addresses"]
+        self.addresses = list(_items(ec2, "describe_addresses", "Addresses"))
         asg = session.client("autoscaling", region_name=region)
         self.groups = {
             g["AutoScalingGroupName"]: g
