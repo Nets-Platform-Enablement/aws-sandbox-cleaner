@@ -92,7 +92,7 @@ def clean_ec2_instances(session: boto3.Session, region: str) -> None:
     # When STOP_EC2 is set, only running instances are worth stopping.
     states = ["running"] if STOP_EC2 else ["pending", "running", "stopping", "stopped"]
     action = "stop" if STOP_EC2 else "terminate"
-    targets: list[str] = []
+    targets: list[tuple[str, str]] = []
     for page in paginator.paginate(
         Filters=[{"Name": "instance-state-name", "Values": states}]
     ):
@@ -101,29 +101,39 @@ def clean_ec2_instances(session: boto3.Session, region: str) -> None:
                 if _tags_protect(inst.get("Tags")):
                     continue
                 iid = inst["InstanceId"]
-                _record("EC2 instance", iid, region, inst.get("InstanceType", ""), verb=action)
-                targets.append(iid)
+                instance_type = inst.get("InstanceType", "")
+                if DRY_RUN:
+                    _record("EC2 instance", iid, region, instance_type, verb=action)
+                targets.append((iid, instance_type))
     if targets and not DRY_RUN:
         # stop/terminate accept at most 1,000 instance IDs per request.
         for batch in _chunked(targets, 1000):
+            batch_ids = [iid for iid, _ in batch]
             try:
                 if STOP_EC2:
-                    resp = ec2.stop_instances(InstanceIds=batch)
+                    resp = ec2.stop_instances(InstanceIds=batch_ids)
                 else:
-                    resp = ec2.terminate_instances(InstanceIds=batch)
+                    resp = ec2.terminate_instances(InstanceIds=batch_ids)
             except ClientError as e:
-                logger.warning("Failed to %s EC2 batch of %d: %s", action, len(batch), e)
+                logger.warning("Failed to %s EC2 batch of %d: %s", action, len(batch_ids), e)
                 continue
             # stop/terminate report per-instance failures without raising.
+            failed_ids: set[str] = set()
             for failure in resp.get("Unsuccessful", []):
                 err = failure.get("Error", {})
+                failure_id = failure.get("InstanceId")
+                if failure_id:
+                    failed_ids.add(failure_id)
                 logger.warning(
                     "Failed to %s EC2 instance %s: %s - %s",
                     action,
-                    failure.get("InstanceId", "?"),
+                    failure_id or "?",
                     err.get("Code", ""),
                     err.get("Message", ""),
                 )
+            for iid, instance_type in batch:
+                if iid not in failed_ids:
+                    _record("EC2 instance", iid, region, instance_type, verb=action)
 
 
 def clean_ebs_volumes(session: boto3.Session, region: str) -> None:
