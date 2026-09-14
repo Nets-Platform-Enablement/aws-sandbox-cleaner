@@ -518,12 +518,14 @@ def clean_elasticache(session: boto3.Session, region: str) -> None:
             if tags is None or _tags_protect(tags):
                 continue
             rgid = rg["ReplicationGroupId"]
-            _record("ElastiCache replication group", rgid, region)
-            if not DRY_RUN:
+            if DRY_RUN:
+                _record("ElastiCache replication group", rgid, region)
+            else:
                 try:
                     ec.delete_replication_group(
                         ReplicationGroupId=rgid, RetainPrimaryCluster=False
                     )
+                    _record("ElastiCache replication group", rgid, region)
                 except ClientError as e:
                     logger.warning(
                         "Failed to delete ElastiCache replication group %s: %s", rgid, e
@@ -539,10 +541,12 @@ def clean_elasticache(session: boto3.Session, region: str) -> None:
             if tags is None or _tags_protect(tags):
                 continue
             cid = cluster["CacheClusterId"]
-            _record("ElastiCache cluster", cid, region, cluster.get("Engine", ""))
-            if not DRY_RUN:
+            if DRY_RUN:
+                _record("ElastiCache cluster", cid, region, cluster.get("Engine", ""))
+            else:
                 try:
                     ec.delete_cache_cluster(CacheClusterId=cid)
+                    _record("ElastiCache cluster", cid, region, cluster.get("Engine", ""))
                 except ClientError as e:
                     logger.warning("Failed to delete ElastiCache cluster %s: %s", cid, e)
 
@@ -580,30 +584,34 @@ def clean_amis(session: boto3.Session, region: str) -> None:
             # A snapshot with its own protection tag is retained even though its
             # AMI is deregistered.
             protected = _protected_snapshots(ec2, snapshot_ids)
+            if protected is None:
+                logger.info("Skipping AMI %s: unable to read snapshot protection tags", image_id)
+                continue
             deletable = [s for s in snapshot_ids if s not in protected]
 
-            _record("AMI", image_id, region, image.get("Name", ""))
-            if not DRY_RUN:
+            if DRY_RUN:
+                _record("AMI", image_id, region, image.get("Name", ""))
+                for snap_id in deletable:
+                    _record("AMI snapshot", snap_id, region, f"from {image_id}")
+            else:
                 try:
                     ec2.deregister_image(ImageId=image_id)
+                    _record("AMI", image_id, region, image.get("Name", ""))
                 except ClientError as e:
                     logger.warning("Failed to deregister AMI %s: %s", image_id, e)
                     continue
                 for snap_id in deletable:
-                    _record("AMI snapshot", snap_id, region, f"from {image_id}")
                     try:
                         ec2.delete_snapshot(SnapshotId=snap_id)
+                        _record("AMI snapshot", snap_id, region, f"from {image_id}")
                     except ClientError as e:
                         logger.warning("Failed to delete snapshot %s: %s", snap_id, e)
-            else:
-                for snap_id in deletable:
-                    _record("AMI snapshot", snap_id, region, f"from {image_id}")
         next_token = resp.get("NextToken")
         if not next_token:
             break
 
 
-def _protected_snapshots(ec2, snapshot_ids: list[str]) -> set[str]:
+def _protected_snapshots(ec2, snapshot_ids: list[str]) -> set[str] | None:
     """Return the subset of snapshot IDs carrying a protection tag."""
     if not snapshot_ids:
         return set()
@@ -611,7 +619,7 @@ def _protected_snapshots(ec2, snapshot_ids: list[str]) -> set[str]:
         snaps = ec2.describe_snapshots(SnapshotIds=snapshot_ids)["Snapshots"]
     except ClientError as e:
         logger.warning("Failed to read snapshot tags: %s", e)
-        return set()
+        return None
     return {s["SnapshotId"] for s in snaps if _tags_protect(s.get("Tags"))}
 
 

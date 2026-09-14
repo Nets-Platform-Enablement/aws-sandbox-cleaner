@@ -49,6 +49,11 @@ variable "lambda_timeout" {
   description = "Lambda timeout in seconds."
   type        = number
   default     = 900
+
+  validation {
+    condition     = var.lambda_timeout >= 1 && var.lambda_timeout <= 900
+    error_message = "lambda_timeout must be between 1 and 900 seconds."
+  }
 }
 
 # security guard for deploying the Lambda
