@@ -1,0 +1,1 @@
+This Lambda, nicknamed Vorlon Planet Killer, removes all non-essential resources from an account. It is intended exclusively for sandbox use and is not suitable for production environments.
