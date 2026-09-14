@@ -12,7 +12,7 @@ import logging
 import os
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -70,6 +70,11 @@ def _tags_protect(tags: list[dict] | None) -> bool:
     return bool(keys & PROTECT_TAG_KEYS)
 
 
+def _chunked(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
 def _enabled_regions(session: boto3.Session) -> list[str]:
     ec2 = session.client("ec2")
     resp = ec2.describe_regions(AllRegions=False)
@@ -99,20 +104,26 @@ def clean_ec2_instances(session: boto3.Session, region: str) -> None:
                 _record("EC2 instance", iid, region, inst.get("InstanceType", ""), verb=action)
                 targets.append(iid)
     if targets and not DRY_RUN:
-        if STOP_EC2:
-            resp = ec2.stop_instances(InstanceIds=targets)
-        else:
-            resp = ec2.terminate_instances(InstanceIds=targets)
-        # stop/terminate report per-instance failures without raising.
-        for failure in resp.get("Unsuccessful", []):
-            err = failure.get("Error", {})
-            logger.warning(
-                "Failed to %s EC2 instance %s: %s - %s",
-                action,
-                failure.get("InstanceId", "?"),
-                err.get("Code", ""),
-                err.get("Message", ""),
-            )
+        # stop/terminate accept at most 1,000 instance IDs per request.
+        for batch in _chunked(targets, 1000):
+            try:
+                if STOP_EC2:
+                    resp = ec2.stop_instances(InstanceIds=batch)
+                else:
+                    resp = ec2.terminate_instances(InstanceIds=batch)
+            except ClientError as e:
+                logger.warning("Failed to %s EC2 batch of %d: %s", action, len(batch), e)
+                continue
+            # stop/terminate report per-instance failures without raising.
+            for failure in resp.get("Unsuccessful", []):
+                err = failure.get("Error", {})
+                logger.warning(
+                    "Failed to %s EC2 instance %s: %s - %s",
+                    action,
+                    failure.get("InstanceId", "?"),
+                    err.get("Code", ""),
+                    err.get("Message", ""),
+                )
 
 
 def clean_ebs_volumes(session: boto3.Session, region: str) -> None:
@@ -202,6 +213,9 @@ def clean_load_balancers(session: boto3.Session, region: str) -> None:
     for lb in elb.get_paginator("describe_load_balancers").paginate():
         for entry in lb["LoadBalancerDescriptions"]:
             name = entry["LoadBalancerName"]
+            tags = elb.describe_tags(LoadBalancerNames=[name])["TagDescriptions"][0]["Tags"]
+            if _tags_protect(tags):
+                continue
             _record("classic load balancer", name, region)
             if not DRY_RUN:
                 try:
@@ -220,7 +234,8 @@ def clean_rds(session: boto3.Session, region: str) -> None:
         for db in page["DBInstances"]:
             if db.get("DBClusterIdentifier"):
                 continue
-            if _tags_protect(db.get("TagList")):
+            # DescribeDBInstances does not populate TagList; fetch tags by ARN.
+            if _tags_protect(_rds_tags(rds, db["DBInstanceArn"])):
                 continue
             dbid = db["DBInstanceIdentifier"]
             _record("RDS instance", dbid, region, db.get("DBInstanceClass", ""))
@@ -230,12 +245,18 @@ def clean_rds(session: boto3.Session, region: str) -> None:
     # Aurora clusters
     for page in rds.get_paginator("describe_db_clusters").paginate():
         for cluster in page["DBClusters"]:
-            if _tags_protect(cluster.get("TagList")):
+            if _tags_protect(_rds_tags(rds, cluster["DBClusterArn"])):
                 continue
-            cid = cluster["DBClusterIdentifier"]
-            _record("RDS cluster", cid, region, cluster.get("Engine", ""))
-            if not DRY_RUN:
-                _delete_db_cluster(rds, cluster, region)
+            _clean_db_cluster(rds, cluster, region)
+
+
+def _rds_tags(rds, arn: str) -> list[dict]:
+    """RDS Describe* calls omit tags; they must be fetched per resource ARN."""
+    try:
+        return rds.list_tags_for_resource(ResourceName=arn).get("TagList", [])
+    except ClientError as e:
+        logger.warning("Failed to read RDS tags for %s: %s", arn, e)
+        return []
 
 
 def _delete_db_instance(rds, dbid: str, deletion_protection: bool) -> None:
@@ -250,22 +271,36 @@ def _delete_db_instance(rds, dbid: str, deletion_protection: bool) -> None:
         rds.delete_db_instance(
             DBInstanceIdentifier=dbid, SkipFinalSnapshot=True, DeleteAutomatedBackups=True
         )
-    except ClientError as e:
+    except (ClientError, BotoCoreError) as e:
         logger.warning("Failed to delete RDS instance %s: %s", dbid, e)
 
 
-def _delete_db_cluster(rds, cluster: dict, region: str) -> None:
-    """Delete a cluster after its member instances have finished deleting."""
+def _clean_db_cluster(rds, cluster: dict, region: str) -> None:
+    """Record and (unless dry run) delete a cluster and its member instances."""
     cid = cluster["DBClusterIdentifier"]
+    members = []
+    for m in cluster.get("DBClusterMembers", []):
+        mid = m["DBInstanceIdentifier"]
+        desc = rds.describe_db_instances(DBInstanceIdentifier=mid)["DBInstances"][0]
+        # A member protected by its own tag preserves the whole cluster.
+        if _tags_protect(_rds_tags(rds, desc["DBInstanceArn"])):
+            logger.info("Skipping RDS cluster %s: member %s is protected", cid, mid)
+            return
+        members.append((mid, desc.get("DeletionProtection", False)))
+
+    for mid, _ in members:
+        _record("RDS cluster member", mid, region)
+    _record("RDS cluster", cid, region, cluster.get("Engine", ""))
+
+    if DRY_RUN:
+        return
+
     try:
         # Members must be gone before delete_db_cluster is accepted.
-        members = [m["DBInstanceIdentifier"] for m in cluster.get("DBClusterMembers", [])]
-        for member in members:
-            desc = rds.describe_db_instances(DBInstanceIdentifier=member)["DBInstances"][0]
-            _record("RDS cluster member", member, region)
-            _delete_db_instance(rds, member, desc.get("DeletionProtection", False))
-        for member in members:
-            rds.get_waiter("db_instance_deleted").wait(DBInstanceIdentifier=member)
+        for mid, protected in members:
+            _delete_db_instance(rds, mid, protected)
+        for mid, _ in members:
+            rds.get_waiter("db_instance_deleted").wait(DBInstanceIdentifier=mid)
 
         if cluster.get("DeletionProtection"):
             rds.modify_db_cluster(
@@ -273,7 +308,7 @@ def _delete_db_cluster(rds, cluster: dict, region: str) -> None:
             )
             rds.get_waiter("db_cluster_available").wait(DBClusterIdentifier=cid)
         rds.delete_db_cluster(DBClusterIdentifier=cid, SkipFinalSnapshot=True)
-    except ClientError as e:
+    except (ClientError, BotoCoreError) as e:
         logger.warning("Failed to delete RDS cluster %s: %s", cid, e)
 
 
@@ -301,26 +336,43 @@ def clean_ecs(session: boto3.Session, region: str) -> None:
                         except ClientError as e:
                             logger.warning("Failed to delete ECS service %s: %s", svc_arn, e)
 
-            # Stop standalone tasks that are not owned by a service.
+            # Stop standalone tasks (those not owned by a service).
+            stopped_tasks: list[str] = []
             for task_page in ecs.get_paginator("list_tasks").paginate(cluster=cluster_arn):
-                for task_arn in task_page["taskArns"]:
-                    _record("ECS task", task_arn, region, verb="stop")
-                    if not DRY_RUN:
-                        try:
-                            ecs.stop_task(cluster=cluster_arn, task=task_arn)
-                        except ClientError as e:
-                            logger.warning("Failed to stop ECS task %s: %s", task_arn, e)
+                for batch in _chunked(task_page["taskArns"], 100):
+                    if not batch:
+                        continue
+                    described = ecs.describe_tasks(
+                        cluster=cluster_arn, tasks=batch, include=["TAGS"]
+                    )["tasks"]
+                    for task in described:
+                        # Service tasks (group "service:<name>") are drained via the
+                        # service deletion above, so only standalone tasks remain.
+                        if str(task.get("group", "")).startswith("service:"):
+                            continue
+                        if _tags_protect(_norm_ecs_tags(task.get("tags"))):
+                            continue
+                        task_arn = task["taskArn"]
+                        _record("ECS task", task_arn, region, verb="stop")
+                        if not DRY_RUN:
+                            try:
+                                ecs.stop_task(cluster=cluster_arn, task=task_arn)
+                                stopped_tasks.append(task_arn)
+                            except ClientError as e:
+                                logger.warning("Failed to stop ECS task %s: %s", task_arn, e)
 
             _record("ECS cluster", cluster_arn, region)
             if not DRY_RUN:
                 try:
-                    # delete_service is async; wait for services to drain first.
+                    # delete_service and stop_task are async; wait for both to drain.
                     if deleted_services:
                         ecs.get_waiter("services_inactive").wait(
                             cluster=cluster_arn, services=deleted_services
                         )
+                    for batch in _chunked(stopped_tasks, 100):
+                        ecs.get_waiter("tasks_stopped").wait(cluster=cluster_arn, tasks=batch)
                     ecs.delete_cluster(cluster=cluster_arn)
-                except ClientError as e:
+                except (ClientError, BotoCoreError) as e:
                     logger.warning("Failed to delete ECS cluster %s: %s", cluster_arn, e)
 
 
@@ -359,6 +411,11 @@ def clean_eks(session: boto3.Session, region: str) -> None:
             deleted_profiles: list[str] = []
             for fp_page in eks.get_paginator("list_fargate_profiles").paginate(clusterName=name):
                 for fp in fp_page["fargateProfileNames"]:
+                    fp_desc = eks.describe_fargate_profile(
+                        clusterName=name, fargateProfileName=fp
+                    )["fargateProfile"]
+                    if _dict_tags_protect(fp_desc.get("tags")):
+                        continue
                     _record("EKS Fargate profile", f"{name}/{fp}", region)
                     if not DRY_RUN:
                         try:
@@ -378,7 +435,7 @@ def clean_eks(session: boto3.Session, region: str) -> None:
                             clusterName=name, fargateProfileName=fp
                         )
                     eks.delete_cluster(name=name)
-                except ClientError as e:
+                except (ClientError, BotoCoreError) as e:
                     logger.warning("Failed to delete EKS cluster %s: %s", name, e)
 
 
@@ -394,6 +451,8 @@ def clean_elasticache(session: boto3.Session, region: str) -> None:
     # clusters cannot be deleted individually with delete_cache_cluster.
     for page in ec.get_paginator("describe_replication_groups").paginate():
         for rg in page["ReplicationGroups"]:
+            if _tags_protect(_elasticache_tags(ec, rg.get("ARN"))):
+                continue
             rgid = rg["ReplicationGroupId"]
             _record("ElastiCache replication group", rgid, region)
             if not DRY_RUN:
@@ -412,6 +471,8 @@ def clean_elasticache(session: boto3.Session, region: str) -> None:
         for cluster in page["CacheClusters"]:
             if cluster.get("ReplicationGroupId"):
                 continue
+            if _tags_protect(_elasticache_tags(ec, cluster.get("ARN"))):
+                continue
             cid = cluster["CacheClusterId"]
             _record("ElastiCache cluster", cid, region, cluster.get("Engine", ""))
             if not DRY_RUN:
@@ -421,36 +482,72 @@ def clean_elasticache(session: boto3.Session, region: str) -> None:
                     logger.warning("Failed to delete ElastiCache cluster %s: %s", cid, e)
 
 
+def _elasticache_tags(ec, arn: str | None) -> list[dict]:
+    """describe_* omits tags for ElastiCache; fetch them by ARN."""
+    if not arn:
+        return []
+    try:
+        return ec.list_tags_for_resource(ResourceName=arn).get("TagList", [])
+    except ClientError as e:
+        logger.warning("Failed to read ElastiCache tags for %s: %s", arn, e)
+        return []
+
+
 def clean_amis(session: boto3.Session, region: str) -> None:
     ec2 = session.client("ec2", region_name=region)
     # Only AMIs owned by this account; deregister the image and delete its
     # backing EBS snapshots so they stop incurring storage charges.
-    images = ec2.describe_images(Owners=["self"])["Images"]
-    for image in images:
-        if _tags_protect(image.get("Tags")):
-            continue
-        image_id = image["ImageId"]
-        snapshot_ids = [
-            bdm["Ebs"]["SnapshotId"]
-            for bdm in image.get("BlockDeviceMappings", [])
-            if bdm.get("Ebs", {}).get("SnapshotId")
-        ]
-        _record("AMI", image_id, region, image.get("Name", ""))
-        if not DRY_RUN:
-            try:
-                ec2.deregister_image(ImageId=image_id)
-            except ClientError as e:
-                logger.warning("Failed to deregister AMI %s: %s", image_id, e)
+    # describe_images has no boto3 paginator; page manually via NextToken.
+    next_token = None
+    while True:
+        resp = ec2.describe_images(
+            Owners=["self"], **({"NextToken": next_token} if next_token else {})
+        )
+        for image in resp["Images"]:
+            if _tags_protect(image.get("Tags")):
                 continue
-            for snap_id in snapshot_ids:
-                _record("AMI snapshot", snap_id, region, f"from {image_id}")
+            image_id = image["ImageId"]
+            snapshot_ids = [
+                bdm["Ebs"]["SnapshotId"]
+                for bdm in image.get("BlockDeviceMappings", [])
+                if bdm.get("Ebs", {}).get("SnapshotId")
+            ]
+            # A snapshot with its own protection tag is retained even though its
+            # AMI is deregistered.
+            protected = _protected_snapshots(ec2, snapshot_ids)
+            deletable = [s for s in snapshot_ids if s not in protected]
+
+            _record("AMI", image_id, region, image.get("Name", ""))
+            if not DRY_RUN:
                 try:
-                    ec2.delete_snapshot(SnapshotId=snap_id)
+                    ec2.deregister_image(ImageId=image_id)
                 except ClientError as e:
-                    logger.warning("Failed to delete snapshot %s: %s", snap_id, e)
-        else:
-            for snap_id in snapshot_ids:
-                _record("AMI snapshot", snap_id, region, f"from {image_id}")
+                    logger.warning("Failed to deregister AMI %s: %s", image_id, e)
+                    continue
+                for snap_id in deletable:
+                    _record("AMI snapshot", snap_id, region, f"from {image_id}")
+                    try:
+                        ec2.delete_snapshot(SnapshotId=snap_id)
+                    except ClientError as e:
+                        logger.warning("Failed to delete snapshot %s: %s", snap_id, e)
+            else:
+                for snap_id in deletable:
+                    _record("AMI snapshot", snap_id, region, f"from {image_id}")
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+
+
+def _protected_snapshots(ec2, snapshot_ids: list[str]) -> set[str]:
+    """Return the subset of snapshot IDs carrying a protection tag."""
+    if not snapshot_ids:
+        return set()
+    try:
+        snaps = ec2.describe_snapshots(SnapshotIds=snapshot_ids)["Snapshots"]
+    except ClientError as e:
+        logger.warning("Failed to read snapshot tags: %s", e)
+        return set()
+    return {s["SnapshotId"] for s in snaps if _tags_protect(s.get("Tags"))}
 
 
 # Cleaners that run per region.
@@ -482,7 +579,8 @@ def handler(event, context):  # noqa: ARG001 - Lambda signature
         for cleaner in REGIONAL_CLEANERS:
             try:
                 cleaner(session, region)
-            except ClientError as e:
+            except (ClientError, BotoCoreError) as e:
+                # BotoCoreError covers WaiterError raised on waiter timeouts.
                 logger.warning(
                     "Cleaner %s failed in region %s: %s", cleaner.__name__, region, e
                 )

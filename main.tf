@@ -83,13 +83,15 @@ data "aws_iam_policy_document" "assume" {
 }
 
 resource "aws_iam_role" "cleanup" {
+  count              = var.deploy_lambda ? 1 : 0
   name               = "sandbox-cleanup-lambda"
   assume_role_policy = data.aws_iam_policy_document.assume.json
 }
 
 # Logging to CloudWatch.
 resource "aws_iam_role_policy_attachment" "logs" {
-  role       = aws_iam_role.cleanup.name
+  count      = var.deploy_lambda ? 1 : 0
+  role       = aws_iam_role.cleanup[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
@@ -103,11 +105,13 @@ data "aws_iam_policy_document" "cleanup" {
       "ec2:Describe*",
       "elasticloadbalancing:Describe*",
       "rds:Describe*",
+      "rds:ListTagsForResource",
       "ecs:List*",
       "ecs:Describe*",
       "eks:List*",
       "eks:Describe*",
       "elasticache:Describe*",
+      "elasticache:ListTagsForResource",
     ]
     resources = ["*"]
   }
@@ -145,14 +149,15 @@ data "aws_iam_policy_document" "cleanup" {
 }
 
 resource "aws_iam_role_policy" "cleanup" {
+  count  = var.deploy_lambda ? 1 : 0
   name   = "sandbox-cleanup-permissions"
-  role   = aws_iam_role.cleanup.id
+  role   = aws_iam_role.cleanup[0].id
   policy = data.aws_iam_policy_document.cleanup.json
 }
 
 # Allow the Lambda to publish the cleanup report to SNS.
 data "aws_iam_policy_document" "notify" {
-  count = var.notification_email == "" ? 0 : 1
+  count = var.deploy_lambda && var.notification_email != "" ? 1 : 0
 
   statement {
     sid       = "PublishCleanupReport"
@@ -163,9 +168,9 @@ data "aws_iam_policy_document" "notify" {
 }
 
 resource "aws_iam_role_policy" "notify" {
-  count  = var.notification_email == "" ? 0 : 1
+  count  = var.deploy_lambda && var.notification_email != "" ? 1 : 0
   name   = "sandbox-cleanup-notify"
-  role   = aws_iam_role.cleanup.id
+  role   = aws_iam_role.cleanup[0].id
   policy = data.aws_iam_policy_document.notify[0].json
 }
 
@@ -192,7 +197,7 @@ resource "aws_sns_topic_subscription" "report_email" {
 resource "aws_lambda_function" "cleanup" {
   count            = var.deploy_lambda ? 1 : 0
   function_name    = "sandbox-cleanup"
-  role             = aws_iam_role.cleanup.arn
+  role             = aws_iam_role.cleanup[0].arn
   handler          = "cleanup.handler"
   runtime          = "python3.12"
   timeout          = var.lambda_timeout
@@ -221,7 +226,7 @@ resource "aws_cloudwatch_log_group" "cleanup" {
 # --------------------------------------------------------------------------- #
 
 resource "aws_cloudwatch_event_rule" "schedule" {
-  count               = var.schedule_expression == "" ? 0 : 1
+  count               = var.deploy_lambda && var.schedule_expression != "" ? 1 : 0
   name                = "sandbox-cleanup-schedule"
   schedule_expression = var.schedule_expression
 }
