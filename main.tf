@@ -133,7 +133,8 @@ data "aws_iam_policy_document" "cleanup" {
       "ec2:DisassociateAddress",
       "ec2:DeleteNatGateway",
       "ec2:DeregisterImage",
-      "ec2:DeleteSnapshot",
+      "ec2:CreateTags",
+      "ec2:DeleteSnapshot"
       "elasticloadbalancing:DeleteLoadBalancer",
       "elasticloadbalancing:DescribeTags",
       "rds:DeleteDBInstance",
