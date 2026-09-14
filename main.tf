@@ -111,9 +111,10 @@ data "aws_iam_policy_document" "cleanup" {
       "elasticloadbalancing:Describe*",
       "rds:Describe*",
       "rds:ListTagsForResource",
+      "autoscaling:DescribeAutoScalingGroups",
+      "autoscaling:DescribeLaunchConfigurations",
       "ecs:List*",
-      "ecs:Describe*",
-      "eks:List*",
+      "ecs:Describe*"
       "eks:Describe*",
       "elasticache:Describe*",
       "elasticache:ListTagsForResource",
