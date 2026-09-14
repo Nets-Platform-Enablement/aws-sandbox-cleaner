@@ -659,11 +659,16 @@ def _publish_report(session: boto3.Session) -> None:
         logger.info("SNS_TOPIC_ARN not set - skipping notification.")
         return
     subject, body = _build_report()
+    max_body_bytes = max(SNS_MESSAGE_MAX_BYTES - len(subject.encode("utf-8")), 0)
     body_bytes = body.encode("utf-8")
-    if len(body_bytes) > SNS_MESSAGE_MAX_BYTES:
+    if len(body_bytes) > max_body_bytes:
         suffix = "\n\n[truncated]"
-        max_bytes = SNS_MESSAGE_MAX_BYTES - len(suffix.encode("utf-8"))
-        body = body_bytes[:max_bytes].decode("utf-8", errors="ignore") + suffix
+        suffix_bytes = suffix.encode("utf-8")
+        max_bytes = max(max_body_bytes - len(suffix_bytes), 0)
+        if max_body_bytes > len(suffix_bytes):
+            body = body_bytes[:max_bytes].decode("utf-8", errors="ignore") + suffix
+        else:
+            body = body_bytes[:max_body_bytes].decode("utf-8", errors="ignore")
     try:
         region = SNS_TOPIC_ARN.split(":")[3]
         sns = session.client("sns", region_name=region)
