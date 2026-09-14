@@ -120,6 +120,7 @@ data "aws_iam_policy_document" "cleanup" {
       "ec2:StopInstances",
       "ec2:DeleteVolume",
       "ec2:ReleaseAddress",
+      "ec2:DisassociateAddress",
       "ec2:DeleteNatGateway",
       "ec2:DeregisterImage",
       "ec2:DeleteSnapshot",
@@ -132,9 +133,12 @@ data "aws_iam_policy_document" "cleanup" {
       "ecs:DeleteService",
       "ecs:DeleteCluster",
       "ecs:UpdateService",
+      "ecs:StopTask",
       "eks:DeleteNodegroup",
       "eks:DeleteCluster",
+      "eks:DeleteFargateProfile",
       "elasticache:DeleteCacheCluster",
+      "elasticache:DeleteReplicationGroup",
     ]
     resources = ["*"]
   }

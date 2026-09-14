@@ -42,9 +42,20 @@ SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "").strip()
 # Summary of actions for reporting.
 _actions: list[str] = []
 
+# Present-participle form used when an action is actually performed.
+_VERB_GERUND = {
+    "delete": "Deleting",
+    "stop": "Stopping",
+    "terminate": "Terminating",
+    "release": "Releasing",
+}
 
-def _record(action: str, resource: str, region: str, extra: str = "") -> None:
-    prefix = "[DRY-RUN] Would delete" if DRY_RUN else "Deleting"
+
+def _record(action: str, resource: str, region: str, extra: str = "", verb: str = "delete") -> None:
+    if DRY_RUN:
+        prefix = f"[DRY-RUN] Would {verb}"
+    else:
+        prefix = _VERB_GERUND.get(verb, f"{verb.capitalize()}ing")
     msg = f"{prefix} {action} '{resource}' in region {region}"
     if extra:
         msg += f" ({extra})"
@@ -85,13 +96,23 @@ def clean_ec2_instances(session: boto3.Session, region: str) -> None:
                 if _tags_protect(inst.get("Tags")):
                     continue
                 iid = inst["InstanceId"]
-                _record(f"EC2 instance ({action})", iid, region, inst.get("InstanceType", ""))
+                _record("EC2 instance", iid, region, inst.get("InstanceType", ""), verb=action)
                 targets.append(iid)
     if targets and not DRY_RUN:
         if STOP_EC2:
-            ec2.stop_instances(InstanceIds=targets)
+            resp = ec2.stop_instances(InstanceIds=targets)
         else:
-            ec2.terminate_instances(InstanceIds=targets)
+            resp = ec2.terminate_instances(InstanceIds=targets)
+        # stop/terminate report per-instance failures without raising.
+        for failure in resp.get("Unsuccessful", []):
+            err = failure.get("Error", {})
+            logger.warning(
+                "Failed to %s EC2 instance %s: %s - %s",
+                action,
+                failure.get("InstanceId", "?"),
+                err.get("Code", ""),
+                err.get("Message", ""),
+            )
 
 
 def clean_ebs_volumes(session: boto3.Session, region: str) -> None:
@@ -115,21 +136,33 @@ def clean_ebs_volumes(session: boto3.Session, region: str) -> None:
 
 def clean_elastic_ips(session: boto3.Session, region: str) -> None:
     ec2 = session.client("ec2", region_name=region)
-    addresses = ec2.describe_addresses()["Addresses"]
-    for addr in addresses:
-        # An EIP in use (attached to an instance) does not incur a separate charge.
-        if addr.get("AssociationId"):
-            continue
-        if _tags_protect(addr.get("Tags")):
-            continue
-        alloc = addr.get("AllocationId")
-        public_ip = addr.get("PublicIp", "")
-        _record("unassociated Elastic IP", public_ip, region)
-        if not DRY_RUN and alloc:
-            try:
-                ec2.release_address(AllocationId=alloc)
-            except ClientError as e:
-                logger.warning("Failed to release Elastic IP %s: %s", public_ip, e)
+    # describe_addresses has no boto3 paginator; page manually via NextToken.
+    next_token = None
+    while True:
+        resp = ec2.describe_addresses(**({"NextToken": next_token} if next_token else {}))
+        for addr in resp["Addresses"]:
+            if _tags_protect(addr.get("Tags")):
+                continue
+            alloc = addr.get("AllocationId")
+            # Only VPC EIPs (AllocationId) can be released; skip anything else.
+            if not alloc:
+                continue
+            assoc = addr.get("AssociationId")
+            public_ip = addr.get("PublicIp", "")
+            # AWS bills every allocated public IPv4 address, even while associated,
+            # so associated EIPs are disassociated and released too.
+            label = "Elastic IP" if assoc else "unassociated Elastic IP"
+            _record(label, public_ip, region, verb="release")
+            if not DRY_RUN:
+                try:
+                    if assoc:
+                        ec2.disassociate_address(AssociationId=assoc)
+                    ec2.release_address(AllocationId=alloc)
+                except ClientError as e:
+                    logger.warning("Failed to release Elastic IP %s: %s", public_ip, e)
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
 
 
 def clean_nat_gateways(session: boto3.Session, region: str) -> None:
@@ -180,24 +213,19 @@ def clean_load_balancers(session: boto3.Session, region: str) -> None:
 def clean_rds(session: boto3.Session, region: str) -> None:
     rds = session.client("rds", region_name=region)
 
-    # Standalone DB instances
+    # Standalone DB instances. Aurora members (those with a DBClusterIdentifier)
+    # are owned by a cluster and handled in the cluster loop below, so that a
+    # protected cluster is not emptied out here before its tags are checked.
     for page in rds.get_paginator("describe_db_instances").paginate():
         for db in page["DBInstances"]:
+            if db.get("DBClusterIdentifier"):
+                continue
             if _tags_protect(db.get("TagList")):
                 continue
             dbid = db["DBInstanceIdentifier"]
             _record("RDS instance", dbid, region, db.get("DBInstanceClass", ""))
             if not DRY_RUN:
-                try:
-                    if db.get("DeletionProtection"):
-                        rds.modify_db_instance(
-                            DBInstanceIdentifier=dbid, DeletionProtection=False, ApplyImmediately=True
-                        )
-                    rds.delete_db_instance(
-                        DBInstanceIdentifier=dbid, SkipFinalSnapshot=True, DeleteAutomatedBackups=True
-                    )
-                except ClientError as e:
-                    logger.warning("Failed to delete RDS instance %s: %s", dbid, e)
+                _delete_db_instance(rds, dbid, db.get("DeletionProtection", False))
 
     # Aurora clusters
     for page in rds.get_paginator("describe_db_clusters").paginate():
@@ -207,62 +235,183 @@ def clean_rds(session: boto3.Session, region: str) -> None:
             cid = cluster["DBClusterIdentifier"]
             _record("RDS cluster", cid, region, cluster.get("Engine", ""))
             if not DRY_RUN:
-                try:
-                    if cluster.get("DeletionProtection"):
-                        rds.modify_db_cluster(
-                            DBClusterIdentifier=cid, DeletionProtection=False, ApplyImmediately=True
-                        )
-                    rds.delete_db_cluster(DBClusterIdentifier=cid, SkipFinalSnapshot=True)
-                except ClientError as e:
-                    logger.warning("Failed to delete RDS cluster %s: %s", cid, e)
+                _delete_db_cluster(rds, cluster, region)
+
+
+def _delete_db_instance(rds, dbid: str, deletion_protection: bool) -> None:
+    """Delete a DB instance, waiting for any deletion-protection change first."""
+    try:
+        if deletion_protection:
+            rds.modify_db_instance(
+                DBInstanceIdentifier=dbid, DeletionProtection=False, ApplyImmediately=True
+            )
+            # delete_db_instance is rejected while the modification is pending.
+            rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier=dbid)
+        rds.delete_db_instance(
+            DBInstanceIdentifier=dbid, SkipFinalSnapshot=True, DeleteAutomatedBackups=True
+        )
+    except ClientError as e:
+        logger.warning("Failed to delete RDS instance %s: %s", dbid, e)
+
+
+def _delete_db_cluster(rds, cluster: dict, region: str) -> None:
+    """Delete a cluster after its member instances have finished deleting."""
+    cid = cluster["DBClusterIdentifier"]
+    try:
+        # Members must be gone before delete_db_cluster is accepted.
+        members = [m["DBInstanceIdentifier"] for m in cluster.get("DBClusterMembers", [])]
+        for member in members:
+            desc = rds.describe_db_instances(DBInstanceIdentifier=member)["DBInstances"][0]
+            _record("RDS cluster member", member, region)
+            _delete_db_instance(rds, member, desc.get("DeletionProtection", False))
+        for member in members:
+            rds.get_waiter("db_instance_deleted").wait(DBInstanceIdentifier=member)
+
+        if cluster.get("DeletionProtection"):
+            rds.modify_db_cluster(
+                DBClusterIdentifier=cid, DeletionProtection=False, ApplyImmediately=True
+            )
+            rds.get_waiter("db_cluster_available").wait(DBClusterIdentifier=cid)
+        rds.delete_db_cluster(DBClusterIdentifier=cid, SkipFinalSnapshot=True)
+    except ClientError as e:
+        logger.warning("Failed to delete RDS cluster %s: %s", cid, e)
 
 
 def clean_ecs(session: boto3.Session, region: str) -> None:
     ecs = session.client("ecs", region_name=region)
     for page in ecs.get_paginator("list_clusters").paginate():
         for cluster_arn in page["clusterArns"]:
+            # A protected cluster (and everything inside it) is left untouched.
+            cluster_tags = ecs.list_tags_for_resource(resourceArn=cluster_arn).get("tags", [])
+            if _tags_protect(_norm_ecs_tags(cluster_tags)):
+                continue
+
+            deleted_services: list[str] = []
             # Scale services to zero and delete them, then delete the cluster.
             for svc_page in ecs.get_paginator("list_services").paginate(cluster=cluster_arn):
                 for svc_arn in svc_page["serviceArns"]:
+                    svc_tags = ecs.list_tags_for_resource(resourceArn=svc_arn).get("tags", [])
+                    if _tags_protect(_norm_ecs_tags(svc_tags)):
+                        continue
                     _record("ECS service", svc_arn, region)
                     if not DRY_RUN:
                         try:
                             ecs.delete_service(cluster=cluster_arn, service=svc_arn, force=True)
+                            deleted_services.append(svc_arn)
                         except ClientError as e:
                             logger.warning("Failed to delete ECS service %s: %s", svc_arn, e)
+
+            # Stop standalone tasks that are not owned by a service.
+            for task_page in ecs.get_paginator("list_tasks").paginate(cluster=cluster_arn):
+                for task_arn in task_page["taskArns"]:
+                    _record("ECS task", task_arn, region, verb="stop")
+                    if not DRY_RUN:
+                        try:
+                            ecs.stop_task(cluster=cluster_arn, task=task_arn)
+                        except ClientError as e:
+                            logger.warning("Failed to stop ECS task %s: %s", task_arn, e)
+
             _record("ECS cluster", cluster_arn, region)
             if not DRY_RUN:
                 try:
+                    # delete_service is async; wait for services to drain first.
+                    if deleted_services:
+                        ecs.get_waiter("services_inactive").wait(
+                            cluster=cluster_arn, services=deleted_services
+                        )
                     ecs.delete_cluster(cluster=cluster_arn)
                 except ClientError as e:
                     logger.warning("Failed to delete ECS cluster %s: %s", cluster_arn, e)
+
+
+def _norm_ecs_tags(tags: list[dict] | None) -> list[dict]:
+    """ECS/EKS tags use lowercase keys; normalize to the {'Key': ...} form."""
+    if not tags:
+        return []
+    return [{"Key": t.get("key", t.get("Key", ""))} for t in tags]
 
 
 def clean_eks(session: boto3.Session, region: str) -> None:
     eks = session.client("eks", region_name=region)
     for page in eks.get_paginator("list_clusters").paginate():
         for name in page["clusters"]:
+            cluster = eks.describe_cluster(name=name)["cluster"]
+            # A protected cluster and all of its node groups are left untouched.
+            if _dict_tags_protect(cluster.get("tags")):
+                continue
+
+            deleted_nodegroups: list[str] = []
             # Node groups must be deleted before the cluster.
             for ng_page in eks.get_paginator("list_nodegroups").paginate(clusterName=name):
                 for ng in ng_page["nodegroups"]:
+                    ng_desc = eks.describe_nodegroup(clusterName=name, nodegroupName=ng)["nodegroup"]
+                    if _dict_tags_protect(ng_desc.get("tags")):
+                        continue
                     _record("EKS node group", f"{name}/{ng}", region)
                     if not DRY_RUN:
                         try:
                             eks.delete_nodegroup(clusterName=name, nodegroupName=ng)
+                            deleted_nodegroups.append(ng)
                         except ClientError as e:
                             logger.warning("Failed to delete EKS node group %s: %s", ng, e)
+
+            # Fargate profiles must also be removed before the cluster.
+            deleted_profiles: list[str] = []
+            for fp_page in eks.get_paginator("list_fargate_profiles").paginate(clusterName=name):
+                for fp in fp_page["fargateProfileNames"]:
+                    _record("EKS Fargate profile", f"{name}/{fp}", region)
+                    if not DRY_RUN:
+                        try:
+                            eks.delete_fargate_profile(clusterName=name, fargateProfileName=fp)
+                            deleted_profiles.append(fp)
+                        except ClientError as e:
+                            logger.warning("Failed to delete EKS Fargate profile %s: %s", fp, e)
+
             _record("EKS cluster", name, region)
             if not DRY_RUN:
                 try:
+                    # Deletions above are async; the cluster cannot go until they finish.
+                    for ng in deleted_nodegroups:
+                        eks.get_waiter("nodegroup_deleted").wait(clusterName=name, nodegroupName=ng)
+                    for fp in deleted_profiles:
+                        eks.get_waiter("fargate_profile_deleted").wait(
+                            clusterName=name, fargateProfileName=fp
+                        )
                     eks.delete_cluster(name=name)
                 except ClientError as e:
                     logger.warning("Failed to delete EKS cluster %s: %s", name, e)
 
 
+def _dict_tags_protect(tags: dict | None) -> bool:
+    """EKS tags are returned as a plain {key: value} mapping."""
+    return bool(tags) and bool(set(tags) & PROTECT_TAG_KEYS)
+
+
 def clean_elasticache(session: boto3.Session, region: str) -> None:
     ec = session.client("elasticache", region_name=region)
+
+    # Redis/Valkey replication groups must be deleted as a whole; their member
+    # clusters cannot be deleted individually with delete_cache_cluster.
+    for page in ec.get_paginator("describe_replication_groups").paginate():
+        for rg in page["ReplicationGroups"]:
+            rgid = rg["ReplicationGroupId"]
+            _record("ElastiCache replication group", rgid, region)
+            if not DRY_RUN:
+                try:
+                    ec.delete_replication_group(
+                        ReplicationGroupId=rgid, RetainPrimaryCluster=False
+                    )
+                except ClientError as e:
+                    logger.warning(
+                        "Failed to delete ElastiCache replication group %s: %s", rgid, e
+                    )
+
+    # Standalone cache clusters. Members of a replication group are skipped
+    # because they are removed together with the group above.
     for page in ec.get_paginator("describe_cache_clusters").paginate():
         for cluster in page["CacheClusters"]:
+            if cluster.get("ReplicationGroupId"):
+                continue
             cid = cluster["CacheClusterId"]
             _record("ElastiCache cluster", cid, region, cluster.get("Engine", ""))
             if not DRY_RUN:
@@ -353,15 +502,15 @@ def handler(event, context):  # noqa: ARG001 - Lambda signature
 def _log_summary() -> None:
     """Log a final summary of everything the script would delete."""
     header = (
-        "SUMMARY - resources that WOULD be deleted (dry run):"
+        "SUMMARY - resources that WOULD be processed (dry run):"
         if DRY_RUN
-        else "SUMMARY - resources that were deleted:"
+        else "SUMMARY - resources that were processed:"
     )
     logger.info("=" * 72)
     logger.info(header)
     logger.info("=" * 72)
     if not _actions:
-        logger.info("Nothing to delete - no billable resources found.")
+        logger.info("Nothing to process - no billable resources found.")
         return
     for i, action in enumerate(_actions, start=1):
         logger.info("%3d. %s", i, action)
@@ -372,17 +521,17 @@ def _log_summary() -> None:
 def _build_report() -> tuple[str, str]:
     """Return the (subject, body) of the cleanup report email."""
     if DRY_RUN:
-        subject = f"[DRY RUN] Sandbox cleanup - {len(_actions)} resource(s) would be deleted"
-        header = "The following resources WOULD be deleted (dry run):"
+        subject = f"[DRY RUN] Sandbox cleanup - {len(_actions)} resource(s) would be processed"
+        header = "The following resources WOULD be processed (dry run):"
     else:
-        subject = f"Sandbox cleanup - {len(_actions)} resource(s) deleted"
-        header = "The following resources were deleted:"
+        subject = f"Sandbox cleanup - {len(_actions)} resource(s) processed"
+        header = "The following resources were processed:"
 
     if _actions:
         lines = [f"{i:3d}. {action}" for i, action in enumerate(_actions, start=1)]
         body = "\n".join([header, "", *lines, "", f"Total: {len(_actions)} resource(s)."])
     else:
-        body = "Nothing to delete - no billable resources found."
+        body = "Nothing to process - no billable resources found."
 
     # SNS subjects are limited to 100 characters.
     return subject[:100], body
