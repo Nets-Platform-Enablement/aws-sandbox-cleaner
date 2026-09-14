@@ -44,6 +44,14 @@ SNS_PUBLISH_OVERHEAD_BYTES = 1024
 # Summary of actions for reporting.
 _actions: list[str] = []
 
+# Failures encountered during the run. A non-empty list means the run is
+# incomplete and some resources may still exist.
+_failures: list[str] = []
+
+# Stop starting new regions when less than this much Lambda time remains, so the
+# report still publishes and the next scheduled run resumes the remaining work.
+_TIME_BUDGET_MS = 60_000
+
 # Present-participle form used when an action is actually performed.
 _VERB_GERUND = {
     "delete": "Deleting",
@@ -63,6 +71,12 @@ def _record(action: str, resource: str, region: str, extra: str = "", verb: str 
         msg += f" ({extra})"
     logger.info(msg)
     _actions.append(msg)
+
+
+def _record_failure(detail: str) -> None:
+    """Log and track a failure so the report reflects an incomplete run."""
+    logger.warning(detail)
+    _failures.append(detail)
 
 
 def _tags_protect(tags: list[dict] | None) -> bool:
@@ -88,12 +102,81 @@ def _enabled_regions(session: boto3.Session) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
+def _protected_ecs_cluster_names(session: boto3.Session, region: str) -> set[str]:
+    """Names of ECS clusters carrying a protection tag."""
+    ecs = session.client("ecs", region_name=region)
+    names: set[str] = set()
+    try:
+        for page in ecs.get_paginator("list_clusters").paginate():
+            for cluster_arn in page["clusterArns"]:
+                tags = ecs.list_tags_for_resource(resourceArn=cluster_arn).get("tags", [])
+                if _tags_protect(_norm_ecs_tags(tags)):
+                    names.add(cluster_arn.split("/")[-1])
+    except (ClientError, BotoCoreError) as e:
+        _record_failure(f"Failed to enumerate protected ECS clusters in {region}: {e}")
+    return names
+
+
+def _protected_eks_cluster_names(session: boto3.Session, region: str) -> set[str]:
+    """Names of EKS clusters carrying a protection tag."""
+    eks = session.client("eks", region_name=region)
+    names: set[str] = set()
+    try:
+        for page in eks.get_paginator("list_clusters").paginate():
+            for name in page["clusters"]:
+                cluster = eks.describe_cluster(name=name)["cluster"]
+                if _dict_tags_protect(cluster.get("tags")):
+                    names.add(name)
+    except (ClientError, BotoCoreError) as e:
+        _record_failure(f"Failed to enumerate protected EKS clusters in {region}: {e}")
+    return names
+
+
+def _owned_by_protected_cluster(
+    tags: list[dict] | None, protected_ecs: set[str], protected_eks: set[str]
+) -> bool:
+    """True if the EC2 instance belongs to a protected ECS or EKS cluster."""
+    tag_map = {t.get("Key", ""): t.get("Value", "") for t in tags or []}
+    if tag_map.get("aws:ecs:cluster-name") in protected_ecs:
+        return True
+    if tag_map.get("eks:cluster-name") in protected_eks:
+        return True
+    for key in tag_map:
+        if key.startswith("kubernetes.io/cluster/") and key.split("/", 2)[-1] in protected_eks:
+            return True
+    return False
+
+
+def _has_protected_ebs(ec2, inst: dict) -> bool:
+    """True if the instance has a protected volume that would be deleted on
+    termination. Fails closed when volume tags cannot be read."""
+    vol_ids = [
+        bdm["Ebs"]["VolumeId"]
+        for bdm in inst.get("BlockDeviceMappings", [])
+        if bdm.get("Ebs", {}).get("DeleteOnTermination") and bdm["Ebs"].get("VolumeId")
+    ]
+    if not vol_ids:
+        return False
+    try:
+        vols = ec2.describe_volumes(VolumeIds=vol_ids)["Volumes"]
+    except ClientError as e:
+        logger.warning(
+            "Failed to read volume tags for instance %s: %s", inst.get("InstanceId"), e
+        )
+        return True
+    return any(_tags_protect(v.get("Tags")) for v in vols)
+
+
 def clean_ec2_instances(session: boto3.Session, region: str) -> None:
     ec2 = session.client("ec2", region_name=region)
     paginator = ec2.get_paginator("describe_instances")
     # When STOP_EC2 is set, only running instances are worth stopping.
     states = ["running"] if STOP_EC2 else ["pending", "running", "stopping", "stopped"]
     action = "stop" if STOP_EC2 else "terminate"
+    # Instances owned by a protected ECS/EKS cluster must survive this broad pass,
+    # which runs before the cluster cleaners evaluate the parent protection tag.
+    protected_ecs = _protected_ecs_cluster_names(session, region)
+    protected_eks = _protected_eks_cluster_names(session, region)
     targets: list[tuple[str, str]] = []
     for page in paginator.paginate(
         Filters=[{"Name": "instance-state-name", "Values": states}]
@@ -102,7 +185,14 @@ def clean_ec2_instances(session: boto3.Session, region: str) -> None:
             for inst in reservation["Instances"]:
                 if _tags_protect(inst.get("Tags")):
                     continue
+                if _owned_by_protected_cluster(inst.get("Tags"), protected_ecs, protected_eks):
+                    continue
                 iid = inst["InstanceId"]
+                # Terminating implicitly deletes DeleteOnTermination volumes, so a
+                # protected attached volume preserves the whole instance.
+                if not STOP_EC2 and _has_protected_ebs(ec2, inst):
+                    logger.info("Skipping EC2 instance %s: attached volume is protected", iid)
+                    continue
                 instance_type = inst.get("InstanceType", "")
                 if DRY_RUN:
                     _record("EC2 instance", iid, region, instance_type, verb=action)
@@ -196,6 +286,7 @@ def clean_elastic_ips(session: boto3.Session, region: str) -> None:
 def clean_nat_gateways(session: boto3.Session, region: str) -> None:
     ec2 = session.client("ec2", region_name=region)
     paginator = ec2.get_paginator("describe_nat_gateways")
+    deleted: list[str] = []
     for page in paginator.paginate(Filter=[{"Name": "state", "Values": ["available", "pending"]}]):
         for nat in page["NatGateways"]:
             if _tags_protect(nat.get("Tags")):
@@ -206,9 +297,19 @@ def clean_nat_gateways(session: boto3.Session, region: str) -> None:
             else:
                 try:
                     ec2.delete_nat_gateway(NatGatewayId=nid)
+                    deleted.append(nid)
                     _record("NAT gateway", nid, region)
                 except ClientError as e:
                     logger.warning("Failed to delete NAT gateway %s: %s", nid, e)
+    # NAT deletion is async and blocks release of its EIP; wait so clean_elastic_ips
+    # can release those addresses later in this same run.
+    if deleted:
+        waiter = ec2.get_waiter("nat_gateway_deleted")
+        for batch in _chunked(deleted, 5):
+            try:
+                waiter.wait(NatGatewayIds=batch)
+            except (ClientError, BotoCoreError) as e:
+                logger.warning("Failed waiting for NAT gateway deletion in %s: %s", region, e)
 
 
 def clean_load_balancers(session: boto3.Session, region: str) -> None:
@@ -375,13 +476,14 @@ def clean_ecs(session: boto3.Session, region: str) -> None:
                             logger.warning("Failed to delete ECS service %s: %s", svc_arn, e)
 
             # Service deletion is async; wait before handling standalone tasks.
+            # DescribeServices (used by the waiter) accepts at most 10 services.
             if not DRY_RUN and deleted_services:
-                try:
-                    ecs.get_waiter("services_inactive").wait(
-                        cluster=cluster_arn, services=deleted_services
-                    )
-                except (ClientError, BotoCoreError) as e:
-                    logger.warning("Failed waiting for ECS services in %s: %s", cluster_arn, e)
+                waiter = ecs.get_waiter("services_inactive")
+                for batch in _chunked(deleted_services, 10):
+                    try:
+                        waiter.wait(cluster=cluster_arn, services=batch)
+                    except (ClientError, BotoCoreError) as e:
+                        logger.warning("Failed waiting for ECS services in %s: %s", cluster_arn, e)
 
             # Stop standalone tasks (those not owned by a service).
             stopped_tasks: list[str] = []
@@ -421,10 +523,24 @@ def clean_ecs(session: boto3.Session, region: str) -> None:
                     # stop_task is async; wait for tasks to drain before cluster delete.
                     for batch in _chunked(stopped_tasks, 100):
                         ecs.get_waiter("tasks_stopped").wait(cluster=cluster_arn, tasks=batch)
+                    # EC2-backed container instances block delete_cluster.
+                    _deregister_container_instances(ecs, cluster_arn)
                     ecs.delete_cluster(cluster=cluster_arn)
                     _record("ECS cluster", cluster_arn, region)
                 except (ClientError, BotoCoreError) as e:
                     logger.warning("Failed to delete ECS cluster %s: %s", cluster_arn, e)
+
+
+def _deregister_container_instances(ecs, cluster_arn: str) -> None:
+    """Deregister EC2-backed container instances so the cluster can be deleted."""
+    for page in ecs.get_paginator("list_container_instances").paginate(cluster=cluster_arn):
+        for ci_arn in page["containerInstanceArns"]:
+            try:
+                ecs.deregister_container_instance(
+                    cluster=cluster_arn, containerInstance=ci_arn, force=True
+                )
+            except ClientError as e:
+                logger.warning("Failed to deregister container instance %s: %s", ci_arn, e)
 
 
 def _norm_ecs_tags(tags: list[dict] | None) -> list[dict]:
@@ -518,6 +634,11 @@ def clean_elasticache(session: boto3.Session, region: str) -> None:
             if tags is None or _tags_protect(tags):
                 continue
             rgid = rg["ReplicationGroupId"]
+            # RetainPrimaryCluster=false also deletes member clusters, so a
+            # protected member must preserve the whole group.
+            if _replication_group_has_protected_member(ec, rg):
+                logger.info("Skipping ElastiCache replication group %s: a member is protected", rgid)
+                continue
             if DRY_RUN:
                 _record("ElastiCache replication group", rgid, region)
             else:
@@ -562,6 +683,21 @@ def _elasticache_tags(ec, arn: str | None) -> list[dict] | None:
         return None
 
 
+def _replication_group_has_protected_member(ec, rg: dict) -> bool:
+    """True if any member cache cluster is protected. Fails closed when a
+    member's tags cannot be read."""
+    for mid in rg.get("MemberClusters", []):
+        try:
+            desc = ec.describe_cache_clusters(CacheClusterId=mid)["CacheClusters"][0]
+        except (ClientError, IndexError) as e:
+            logger.warning("Failed to describe ElastiCache member %s: %s", mid, e)
+            return True
+        tags = _elasticache_tags(ec, desc.get("ARN"))
+        if tags is None or _tags_protect(tags):
+            return True
+    return False
+
+
 def clean_amis(session: boto3.Session, region: str) -> None:
     ec2 = session.client("ec2", region_name=region)
     # Only AMIs owned by this account; deregister the image and delete its
@@ -601,11 +737,15 @@ def clean_amis(session: boto3.Session, region: str) -> None:
                     logger.warning("Failed to deregister AMI %s: %s", image_id, e)
                     continue
                 for snap_id in deletable:
-                    try:
-                        ec2.delete_snapshot(SnapshotId=snap_id)
+                    if _delete_snapshot_with_retry(ec2, snap_id):
                         _record("AMI snapshot", snap_id, region, f"from {image_id}")
-                    except ClientError as e:
-                        logger.warning("Failed to delete snapshot %s: %s", snap_id, e)
+                    else:
+                        # The AMI is already deregistered, so this snapshot is now
+                        # orphaned; surface it so the billable resource is not lost.
+                        _record_failure(
+                            f"Orphaned AMI snapshot {snap_id} in region {region} "
+                            f"(from {image_id}) could not be deleted"
+                        )
         next_token = resp.get("NextToken")
         if not next_token:
             break
@@ -621,6 +761,19 @@ def _protected_snapshots(ec2, snapshot_ids: list[str]) -> set[str] | None:
         logger.warning("Failed to read snapshot tags: %s", e)
         return None
     return {s["SnapshotId"] for s in snaps if _tags_protect(s.get("Tags"))}
+
+
+def _delete_snapshot_with_retry(ec2, snap_id: str, attempts: int = 3) -> bool:
+    """Delete a snapshot, retrying transient failures."""
+    for attempt in range(1, attempts + 1):
+        try:
+            ec2.delete_snapshot(SnapshotId=snap_id)
+            return True
+        except ClientError as e:
+            logger.warning(
+                "Failed to delete snapshot %s (attempt %d/%d): %s", snap_id, attempt, attempts, e
+            )
+    return False
 
 
 # Cleaners that run per region.
@@ -640,6 +793,7 @@ REGIONAL_CLEANERS = [
 
 def handler(event, context):  # noqa: ARG001 - Lambda signature
     _actions.clear()
+    _failures.clear()
     session = boto3.Session()
 
     mode = "DRY RUN" if DRY_RUN else "DELETE"
@@ -649,25 +803,44 @@ def handler(event, context):  # noqa: ARG001 - Lambda signature
     logger.info("Scanning %d regions", len(regions))
 
     for region in regions:
+        # Several cleaners wait on async deletions; stop starting new regions when
+        # the invocation is about to time out so the report still publishes and the
+        # next scheduled run resumes the remaining (now smaller) workload.
+        if _time_is_up(context):
+            _record_failure(
+                f"Stopped before region {region}: Lambda time budget exhausted; "
+                "remaining regions resume on the next scheduled run"
+            )
+            break
         for cleaner in REGIONAL_CLEANERS:
             try:
                 cleaner(session, region)
             except (ClientError, BotoCoreError) as e:
                 # BotoCoreError covers WaiterError raised on waiter timeouts.
-                logger.warning(
-                    "Cleaner %s failed in region %s: %s", cleaner.__name__, region, e
-                )
+                _record_failure(f"Cleaner {cleaner.__name__} failed in region {region}: {e}")
 
     logger.info("Done. %d resources %s.", len(_actions), "listed" if DRY_RUN else "processed")
+    if _failures:
+        logger.warning("Run incomplete: %d failure(s) recorded.", len(_failures))
 
     _log_summary()
     _publish_report(session)
 
     return {
         "dry_run": DRY_RUN,
+        "complete": not _failures,
         "count": len(_actions),
         "actions": _actions,
+        "failures": _failures,
     }
+
+
+def _time_is_up(context) -> bool:
+    """True when too little Lambda execution time remains to start more work."""
+    try:
+        return context.get_remaining_time_in_millis() < _TIME_BUDGET_MS
+    except AttributeError:
+        return False
 
 
 def _log_summary() -> None:
@@ -704,6 +877,13 @@ def _build_report() -> tuple[str, str]:
     else:
         body = "Nothing to process - no billable resources found."
 
+    if _failures:
+        subject = f"[INCOMPLETE] {subject}"
+        fail_lines = [f"{i:3d}. {f}" for i, f in enumerate(_failures, start=1)]
+        body += "\n\n" + "\n".join(
+            ["INCOMPLETE - resources may remain; the following failures occurred:", "", *fail_lines]
+        )
+
     # SNS subjects are limited to 100 characters.
     return subject[:100], body
 
@@ -733,5 +913,5 @@ def _publish_report(session: boto3.Session) -> None:
         sns = session.client("sns", region_name=region)
         sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=body)
         logger.info("Published cleanup report to %s", SNS_TOPIC_ARN)
-    except (ClientError, IndexError) as e:
+    except (ClientError, BotoCoreError, IndexError) as e:
         logger.warning("Failed to publish cleanup report to SNS: %s", e)

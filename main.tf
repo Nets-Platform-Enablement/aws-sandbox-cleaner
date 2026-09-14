@@ -141,6 +141,7 @@ data "aws_iam_policy_document" "cleanup" {
       "rds:ModifyDBCluster",
       "ecs:DeleteService",
       "ecs:DeleteCluster",
+      "ecs:DeregisterContainerInstance",
       "ecs:UpdateService",
       "ecs:StopTask",
       "eks:DeleteNodegroup",
