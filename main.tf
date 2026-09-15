@@ -51,8 +51,8 @@ variable "lambda_timeout" {
   default     = 900
 
   validation {
-    condition     = var.lambda_timeout >= 1 && var.lambda_timeout <= 900
-    error_message = "lambda_timeout must be between 1 and 900 seconds."
+    condition     = var.lambda_timeout > 45 && var.lambda_timeout <= 900
+    error_message = "lambda_timeout must be between 46 and 900 seconds."
   }
 }
 
@@ -114,7 +114,7 @@ data "aws_iam_policy_document" "cleanup" {
       "autoscaling:DescribeAutoScalingGroups",
       "autoscaling:DescribeLaunchConfigurations",
       "ecs:List*",
-      "ecs:Describe*"
+      "ecs:Describe*",
       "eks:Describe*",
       "elasticache:Describe*",
       "elasticache:ListTagsForResource",
@@ -132,9 +132,10 @@ data "aws_iam_policy_document" "cleanup" {
       "ec2:ReleaseAddress",
       "ec2:DisassociateAddress",
       "ec2:DeleteNatGateway",
+      "ec2:CancelSpotInstanceRequests",
       "ec2:DeregisterImage",
       "ec2:CreateTags",
-      "ec2:DeleteSnapshot"
+      "ec2:DeleteSnapshot",
       "elasticloadbalancing:DeleteLoadBalancer",
       "elasticloadbalancing:DescribeTags",
       "rds:DeleteDBInstance",

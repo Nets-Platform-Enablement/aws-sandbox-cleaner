@@ -242,7 +242,14 @@ class _Protection:
         self.volumes = {
             v["VolumeId"]: v for v in _items(ec2, "describe_volumes", "Volumes")
         }
-        self.addresses = list(_items(ec2, "describe_addresses", "Addresses"))
+        self.addresses = ec2.describe_addresses()["Addresses"]
+        self.spot_requests = {
+            request["SpotInstanceRequestId"]: request
+            for request in _items(
+                ec2, "describe_spot_instance_requests", "SpotInstanceRequests"
+            )
+            if request.get("SpotInstanceRequestId")
+        }
         asg = session.client("autoscaling", region_name=region)
         self.groups = {
             g["AutoScalingGroupName"]: g
@@ -432,6 +439,41 @@ class _Protection:
             or any(f"kubernetes.io/cluster/{name}" in tags for name in eks_names)
         )
 
+    def persistent_spot_request_id(self, instance):
+        request_id = instance.get("SpotInstanceRequestId")
+        request = self.spot_requests.get(request_id) if request_id else None
+        if request and request.get("Type") == "persistent" and request.get(
+            "State"
+        ) in {"open", "active"}:
+            return request_id
+        return None
+
+
+def _cancel_persistent_spot_request(ec2, protection, instance, region):
+    request_id = protection.persistent_spot_request_id(instance)
+    if not request_id:
+        return True
+    try:
+        response = ec2.cancel_spot_instance_requests(
+            SpotInstanceRequestIds=[request_id]
+        )
+    except (ClientError, BotoCoreError) as exc:
+        _record_failure(
+            f"cancel_spot_instance_requests failed for {request_id} in {region}: {exc}"
+        )
+        return False
+    if not any(
+        request.get("SpotInstanceRequestId") == request_id
+        and request.get("State") in {"cancelled", "closed"}
+        for request in response.get("CancelledSpotInstanceRequests", [])
+    ):
+        _record_failure(
+            f"cancel_spot_instance_requests did not confirm {request_id} in {region}"
+        )
+        return False
+    _record("Spot instance request", request_id, region, verb="cancel")
+    return True
+
 
 def clean_ec2_instances(session: boto3.Session, region: str) -> None:
     ec2 = session.client("ec2", region_name=region)
@@ -444,7 +486,6 @@ def clean_ec2_instances(session: boto3.Session, region: str) -> None:
         tags = _tag_map(inst.get("Tags"))
         if (
             iid in protection.managed_ids
-            or inst.get("InstanceLifecycle") == "spot"
             or any(
                 k in tags
                 for k in (
@@ -487,6 +528,10 @@ def clean_ec2_instances(session: boto3.Session, region: str) -> None:
             continue
         # Isolate instances so a protected/stale instance cannot fail the whole batch.
         try:
+            if action == "terminate" and not _cancel_persistent_spot_request(
+                ec2, protection, inst, region
+            ):
+                continue
             response = getattr(ec2, operation)(InstanceIds=[iid])
             if not any(
                 i.get("InstanceId") == iid
@@ -528,7 +573,6 @@ def clean_ebs_volumes(session: boto3.Session, region: str) -> None:
 
 def clean_elastic_ips(session: boto3.Session, region: str) -> None:
     ec2 = session.client("ec2", region_name=region)
-    # DescribeAddresses is not paginated and does not accept NextToken.
     for addr in ec2.describe_addresses()["Addresses"]:
         _check_time()
         alloc = addr.get("AllocationId")
